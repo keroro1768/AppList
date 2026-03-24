@@ -524,4 +524,330 @@ public class Validator
 
 ---
 
+## 十一、Windows All Apps List 資料來源分析
+
+### All Apps List 組成
+
+Windows 的 All Apps List 實際上是多個來源的**組合**，包括：
+
+| 來源 | 路徑/位置 | 類型 |
+|------|-----------|------|
+| **Start Menu 捷徑** | `%AppData%\Microsoft\Windows\Start Menu\Programs` | 使用者捷徑 |
+| **All Users Start Menu** | `%ProgramData%\Microsoft\Windows\Start Menu\Programs` | 系統捷徑 |
+| **WindowsApps** | `%ProgramFiles%\WindowsApps` | Store App |
+| **Packages** | `%LocalAppData%\Packages` | UWP App 快取 |
+| **Mr.tCache** | `HKCU\SOFTWARE\Classes\Local Settings\MrtCache` | 資源快取 |
+| **Registry** | 多個位置 | Uninstall 資訊 |
+
+### Shell:AppsFolder 組合方式
+
+根據研究，`shell:AppsFolder` 是以下來源的**聯合**：
+
+```
+AppsFolder = 
+    Start Menu 捷徑 (User)
+        + Start Menu 捷徑 (All Users)
+        + WindowsApps (Store Apps)
+        + MrtCache (資源快取)
+        + Registry Uninstall 清單
+```
+
+### 關鍵 Registry 位置
+
+| Registry Key | 說明 |
+|--------------|------|
+| `HKCU\SOFTWARE\Classes\Local Settings\MrtCache` | MRT 快取（包含 Store App 資訊） |
+| `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` | 已安裝程式 |
+| `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts` | 檔案關聯 |
+
+### 驗證策略
+
+要與 All Apps List 完全一致，必須整合以下來源：
+
+```csharp
+public List<AppInfo> GetAllAppsComplete()
+{
+    var apps = new List<AppInfo>();
+    
+    // 1. Start Menu 捷徑 (使用者)
+    apps.AddRange(GetStartMenuApps(Environment.GetFolderPath(
+        Environment.SpecialFolder.StartMenu)));
+    
+    // 2. Start Menu 捷徑 (All Users)
+    apps.AddRange(GetStartMenuApps(Environment.GetFolderPath(
+        Environment.SpecialFolder.CommonStartMenu)));
+    
+    // 3. Shell:AppsFolder
+    apps.AddRange(GetAppsFolderApps());
+    
+    // 4. Registry Uninstall
+    apps.AddRange(GetRegistryApps());
+    
+    // 5. WindowsApps (Store Apps)
+    apps.AddRange(GetStoreApps());
+    
+    // 去除重複並排序
+    return apps
+        .Where(a => !string.IsNullOrEmpty(a.Name))
+        .GroupBy(a => a.Name.ToLowerInvariant())
+        .Select(g => g.First())
+        .OrderBy(a => a.Name)
+        .ToList();
+}
+```
+
+### UIA 交叉驗證
+
+#### 開啟 All Apps List 並取得項目
+
+```csharp
+using System.Windows.Automation;
+using System.Runtime.InteropServices;
+
+public class AllAppsListValidator
+{
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    
+    private const byte VK_LWIN = 0x5B;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    
+    // 開啟 All Apps List
+    public void OpenAllAppsList()
+    {
+        // 按下 Windows 鍵
+        keybd_event(VK_LWIN, 0, 0, UIntPtr.Zero);
+        keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        
+        Thread.Sleep(300);
+        
+        // 點擊 "All apps" 按鈕（如果有）
+        // 或者使用右鍵 > All Apps
+    }
+    
+    // 使用 UIA 取得 All Apps List 中的所有項目
+    public List<string> GetAllAppsFromUI()
+    {
+        var apps = new List<string>();
+        
+        // 找到開始功能表視窗
+        var startMenu = AutomationElement.RootElement.FindFirst(
+            TreeScope.Children,
+            new PropertyCondition(AutomationElement.ClassNameProperty, "ApplicationFrameWindow"));
+        
+        if (startMenu == null) return apps;
+        
+        // 找到 ScrollViewer 或 List 區域
+        var scrollViewer = startMenu.FindFirst(
+            TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ClassNameProperty, "ScrollViewer"));
+        
+        if (scrollViewer != null)
+        {
+            // 取得所有 ListItem
+            var items = scrollViewer.FindAll(
+                TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+            
+            foreach (AutomationElement item in items)
+            {
+                apps.Add(item.Current.Name);
+            }
+        }
+        
+        return apps;
+    }
+    
+    // 使用更廣泛的搜尋
+    public List<AppInfo> GetAllAppsFromStartMenu()
+    {
+        var apps = new List<AppInfo>();
+        
+        // 搜尋整個 UI 樹
+        var allElements = AutomationElement.RootElement.FindAll(
+            TreeScope.Descendants,
+            Condition.TrueCondition);
+        
+        foreach (AutomationElement element in allElements)
+        {
+            // 檢查是否為應用程式項目
+            if (element.Current.ControlType == ControlType.ListItem ||
+                element.Current.ControlType == ControlType.Button)
+            {
+                var name = element.Current.Name;
+                if (!string.IsNullOrEmpty(name) && name.Length > 0)
+                {
+                    // 過濾非應用程式項目
+                    if (!IsSystemItem(name))
+                    {
+                        apps.Add(new AppInfo
+                        {
+                            Name = name,
+                            AutomationId = element.Current.AutomationId,
+                            Source = AppSource.StartMenu
+                        });
+                    }
+                }
+            }
+        }
+        
+        return apps.Distinct().ToList();
+    }
+    
+    private bool IsSystemItem(string name)
+    {
+        // 過濾系統項目
+        string[] systemItems = new[]
+        {
+            "Settings", "Power", "File Explorer", "Search",
+            "All apps", "Pinned", "Recommended"
+        };
+        
+        return systemItems.Any(s => name.StartsWith(s, StringComparison.OrdinalIgnoreCase));
+    }
+}
+```
+
+### 交叉比對
+
+```csharp
+public class ComparisonResult
+{
+    public List<string> OnlyInOurList { get; set; }
+    public List<string> OnlyInAllAppsList { get; set; }
+    public List<string> InBoth { get; set; }
+    
+    public void Print()
+    {
+        Console.WriteLine($"=== 比較結果 ===");
+        Console.WriteLine($"我們的列表: {OnlyInOurList.Count + InBoth.Count}");
+        Console.WriteLine($"All Apps List: {OnlyInAllAppsList.Count + InBoth.Count}");
+        Console.WriteLine($"共同: {InBoth.Count}");
+        Console.WriteLine($"僅在我們: {OnlyInOurList.Count}");
+        Console.WriteLine($"僅在 All Apps: {OnlyInAllAppsList.Count}");
+        
+        if (OnlyInAllAppsList.Count > 0)
+        {
+            Console.WriteLine("\n只在 All Apps List:");
+            foreach (var app in OnlyInAllAppsList.Take(20))
+            {
+                Console.WriteLine($"  - {app}");
+            }
+        }
+    }
+}
+
+public ComparisonResult CompareWithAllAppsList()
+{
+    var ourApps = new AppLister().GetAllAppsComplete()
+        .Select(a => a.Name.ToLowerInvariant().Trim())
+        .ToHashSet();
+    
+    var uiApps = new AllAppsListValidator().GetAllAppsFromStartMenu()
+        .Select(a => a.Name.ToLowerInvariant().Trim())
+        .ToHashSet();
+    
+    var onlyInOurList = ourApps.Except(uiApps).ToList();
+    var onlyInAllAppsList = uiApps.Except(ourApps).ToList();
+    var inBoth = ourApps.Intersect(uiApps).ToList();
+    
+    return new ComparisonResult
+    {
+        OnlyInOurList = onlyInOurList,
+        OnlyInAllAppsList = onlyInAllAppsList,
+        InBoth = inBoth
+    };
+}
+```
+
+### 完成清單策略
+
+根據研究，要達到與 All Apps List 一致，必須包含：
+
+```csharp
+// 完整來源清單
+public enum AppDataSource
+{
+    // Start Menu
+    StartMenuUser,           // %AppData%\...\Start Menu\Programs
+    StartMenuCommon,         // %ProgramData%\...\Start Menu\Programs
+    
+    // Shell
+    AppsFolder,             // shell:AppsFolder
+    
+    // Registry
+    RegistryUninstall,      // HKLM\...\Uninstall
+    RegistryUninstall32,    // HKLM\...\WOW6432Node\...\Uninstall
+    MrtCache,               // HKCU\SOFTWARE\Classes\Local Settings\MrtCache
+    
+    // Store
+    AppxPackage,            // Get-AppxPackage
+    WindowsApps,            // %ProgramFiles%\WindowsApps
+    
+    // Others
+    Desktop,                // 桌面捷徑
+    StartupFolder,          // 啟動資料夾
+    SendTo,                 // 傳送到
+}
+```
+
+---
+
+## 十二、驗證腳本完整範例
+
+```csharp
+class Program
+{
+    static void Main(string[] args)
+    {
+        Console.WriteLine("=== Windows 應用程式列表驗證 ===\n");
+        
+        var validator = new AllAppsListValidator();
+        var lister = new AppLister();
+        
+        // 1. 開啟 All Apps List 並取得 UI 項目
+        Console.WriteLine("1. 開啟 All Apps List...");
+        validator.OpenAllAppsList();
+        Thread.Sleep(1000);
+        
+        var uiApps = validator.GetAllAppsFromStartMenu();
+        Console.WriteLine($"   UI 項目數: {uiApps.Count}");
+        
+        // 2. 取得我們的完整清單
+        Console.WriteLine("2. 取得系統應用程式...");
+        var systemApps = lister.GetAllAppsComplete();
+        Console.WriteLine($"   系統項目數: {systemApps.Count}");
+        
+        // 3. 比對
+        Console.WriteLine("3. 比對結果...");
+        var result = CompareApps(uiApps, systemApps);
+        result.Print();
+        
+        Console.WriteLine("\n=== 驗證完成 ===");
+    }
+    
+    static ComparisonResult CompareApps(List<AppInfo> uiApps, List<AppInfo> systemApps)
+    {
+        var uiNames = uiApps.Select(a => NormalizeName(a.Name)).ToHashSet();
+        var sysNames = systemApps.Select(a => NormalizeName(a.Name)).ToHashSet();
+        
+        return new ComparisonResult
+        {
+            OnlyInOurList = sysNames.Except(uiNames).ToList(),
+            OnlyInAllAppsList = uiNames.Except(sysNames).ToList(),
+            InBoth = sysNames.Intersect(uiNames).ToList()
+        };
+    }
+    
+    static string NormalizeName(string name)
+    {
+        return name?.ToLowerInvariant().Trim() ?? "";
+    }
+}
+```
+
+---
+
 *建立時間: 2026-03-25*
+*更新時間: 2026-03-25*
+
